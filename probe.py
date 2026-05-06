@@ -13,17 +13,131 @@ from __future__ import annotations
 import os
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
 PROBE_TYPE = os.getenv("PROBE_TYPE", "logreg")
+
+
+IMPORTANCE_GROUPS = (
+    "all_spectral",
+    "top_eigenvalues",
+    "sum_eigenvalues",
+    "logdet",
+    "effective_rank",
+    "participation_ratio",
+    "condition_number",
+    "spectral_entropy",
+    "spectral_by_window_8",
+    "spectral_by_window_16",
+    "spectral_by_window_32",
+    "spectral_by_window_64",
+)
+
+
+def _feature_group_indices(feature_names: list[str]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = {group: [] for group in IMPORTANCE_GROUPS}
+    for idx, name in enumerate(feature_names):
+        if not name.startswith("spectral__"):
+            continue
+
+        groups["all_spectral"].append(idx)
+
+        if "__top_eig_" in name:
+            groups["top_eigenvalues"].append(idx)
+        if name.endswith("__sum_eigenvalues"):
+            groups["sum_eigenvalues"].append(idx)
+        if name.endswith("__logdet"):
+            groups["logdet"].append(idx)
+        if name.endswith("__effective_rank"):
+            groups["effective_rank"].append(idx)
+        if name.endswith("__participation_ratio"):
+            groups["participation_ratio"].append(idx)
+        if name.endswith("__condition_number"):
+            groups["condition_number"].append(idx)
+        if name.endswith("__spectral_entropy"):
+            groups["spectral_entropy"].append(idx)
+
+        for width in (8, 16, 32, 64):
+            if f"__window_{width}__" in name:
+                groups[f"spectral_by_window_{width}"].append(idx)
+
+    return groups
+
+
+def _score_probe(
+    probe: "HallucinationProbe",
+    X: np.ndarray,
+    y: np.ndarray,
+    metric: str,
+) -> float:
+    if metric == "accuracy":
+        return float(accuracy_score(y, probe.predict(X)))
+    if metric == "auroc":
+        try:
+            return float(roc_auc_score(y, probe.predict_proba(X)[:, 1]))
+        except ValueError:
+            return float("nan")
+    raise ValueError("metric must be either 'accuracy' or 'auroc'.")
+
+
+def permutation_importance_by_group(
+    probe: "HallucinationProbe",
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    feature_names: list[str],
+    metrics: tuple[str, ...] = ("accuracy", "auroc"),
+    n_repeats: int = 10,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Measure validation-only group permutation importance.
+
+    The fitted probe is kept fixed.  For each spectral feature group, values
+    are shuffled across validation rows and the score drop is recorded.
+    """
+    X_val = np.asarray(X_val, dtype=np.float32)
+    y_val = np.asarray(y_val, dtype=int)
+    rng = np.random.default_rng(random_state)
+    groups = _feature_group_indices(feature_names)
+
+    rows: list[dict] = []
+    for metric in metrics:
+        baseline_score = _score_probe(probe, X_val, y_val, metric)
+        for group, indices in groups.items():
+            if not indices:
+                continue
+
+            permuted_scores: list[float] = []
+            for _ in range(n_repeats):
+                X_perm = X_val.copy()
+                order = rng.permutation(X_perm.shape[0])
+                X_perm[:, indices] = X_perm[order][:, indices]
+                permuted_scores.append(_score_probe(probe, X_perm, y_val, metric))
+
+            scores = np.asarray(permuted_scores, dtype=float)
+            importances = baseline_score - scores
+            rows.append(
+                {
+                    "group": group,
+                    "metric": metric,
+                    "baseline_score": baseline_score,
+                    "permuted_score_mean": float(np.nanmean(scores)),
+                    "permuted_score_std": float(np.nanstd(scores)),
+                    "importance_mean": float(np.nanmean(importances)),
+                    "importance_std": float(np.nanstd(importances)),
+                    "n_features": len(indices),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 class HallucinationProbe(nn.Module):
