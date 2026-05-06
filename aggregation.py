@@ -22,9 +22,8 @@ import os
 import torch
 
 
-AGGREGATION_MODE = os.getenv(
-    "AGGREGATION_MODE", "mean_10_20_plus_21_24_plus_final"
-)
+AGGREGATION_MODE = os.getenv("AGGREGATION_MODE", "mean_21_24")
+SPECTRAL_MODE = os.getenv("SPECTRAL_MODE", "none")
 
 SUPPORTED_AGGREGATION_MODES = (
     "final_only",
@@ -35,6 +34,23 @@ SUPPORTED_AGGREGATION_MODES = (
     "mean_10_20_plus_final",
     "mean_10_20_plus_21_24_plus_final",
 )
+
+SUPPORTED_SPECTRAL_MODES = (
+    "none",
+    "top_eigenvalues",
+    "sum_eigenvalues",
+    "logdet",
+    "effective_rank",
+    "participation_ratio",
+    "condition_number",
+    "spectral_entropy",
+    "all",
+    "all_without_condition_number",
+)
+
+SPECTRAL_WINDOWS = (8, 16, 32, 64)
+SPECTRAL_TOP_K = 5
+_LAST_FEATURE_NAMES: list[str] = []
 
 
 def _as_layer_tensor(hidden_states: torch.Tensor | tuple | list) -> torch.Tensor:
@@ -121,6 +137,150 @@ def _pool_tail_tokens(
     return torch.cat(pooled, dim=0), real_sequence
 
 
+def _spectral_stats_enabled(mode: str) -> tuple[str, ...]:
+    """Return spectral statistic names included by ``mode``."""
+    stats = {
+        "none": (),
+        "top_eigenvalues": tuple(f"top_eig_{i}" for i in range(1, SPECTRAL_TOP_K + 1)),
+        "sum_eigenvalues": ("sum_eigenvalues",),
+        "logdet": ("logdet",),
+        "effective_rank": ("effective_rank",),
+        "participation_ratio": ("participation_ratio",),
+        "condition_number": ("log_condition_number",),
+        "spectral_entropy": ("spectral_entropy",),
+        "all_without_condition_number": (
+            *(f"top_eig_{i}" for i in range(1, SPECTRAL_TOP_K + 1)),
+            "sum_eigenvalues",
+            "logdet",
+            "effective_rank",
+            "participation_ratio",
+            "spectral_entropy",
+        ),
+        "all": (
+            *(f"top_eig_{i}" for i in range(1, SPECTRAL_TOP_K + 1)),
+            "sum_eigenvalues",
+            "logdet",
+            "effective_rank",
+            "participation_ratio",
+            "log_condition_number",
+            "spectral_entropy",
+        ),
+    }
+    if mode not in stats:
+        raise ValueError(
+            f"Unknown SPECTRAL_MODE={mode!r}. Supported modes: "
+            f"{', '.join(SUPPORTED_SPECTRAL_MODES)}"
+        )
+    return stats[mode]
+
+
+def _zero_spectral_values(
+    stats: tuple[str, ...],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    return {
+        stat: torch.tensor(0.0, device=device, dtype=torch.float32)
+        for stat in stats
+    }
+
+
+def _spectral_features_for_window(
+    real_sequence: torch.Tensor,
+    width: int,
+    stats: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Compute stable Gram-spectrum features for a tail token window."""
+    if not stats:
+        return {}
+
+    device = real_sequence.device
+    if real_sequence.size(0) < 2:
+        return _zero_spectral_values(stats, device)
+
+    tail = real_sequence[-min(width, real_sequence.size(0)) :].to(dtype=torch.float64)
+    if tail.size(0) < 2:
+        return _zero_spectral_values(stats, device)
+
+    eps = 1e-8
+    centered = tail - tail.mean(dim=0, keepdim=True)
+    gram = centered @ centered.T / max(float(centered.size(1)), 1.0)
+    eig = torch.linalg.eigvalsh(gram).clamp_min(eps)
+    eig = torch.nan_to_num(eig, nan=eps, posinf=eps, neginf=eps)
+    eig_desc = torch.sort(eig, descending=True).values
+
+    eig_sum = eig.sum()
+    spectral_entropy = -(
+        (eig / (eig_sum + eps)) * torch.log((eig / (eig_sum + eps)) + eps)
+    ).sum()
+    condition_number = eig.max() / eig.min().clamp_min(eps)
+
+    values: dict[str, torch.Tensor] = {}
+    for i in range(SPECTRAL_TOP_K):
+        key = f"top_eig_{i + 1}"
+        values[key] = (
+            eig_desc[i] if i < eig_desc.numel() else torch.tensor(0.0, device=device)
+        )
+    values.update(
+        {
+            "sum_eigenvalues": eig_sum,
+            "logdet": torch.log(eig).sum(),
+            "spectral_entropy": spectral_entropy,
+            "effective_rank": torch.exp(spectral_entropy),
+            "participation_ratio": eig_sum.pow(2) / (eig.pow(2).sum() + eps),
+            "log_condition_number": torch.log(condition_number + eps),
+        }
+    )
+
+    return {
+        stat: torch.nan_to_num(
+            values[stat].to(device=device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        for stat in stats
+    }
+
+
+def _spectral_feature_names(mode: str) -> list[str]:
+    stats = _spectral_stats_enabled(mode)
+    names: list[str] = []
+    for width in SPECTRAL_WINDOWS:
+        for stat in stats:
+            display_stat = (
+                "condition_number" if stat == "log_condition_number" else stat
+            )
+            names.append(
+                "spectral__block_mean_21_24"
+                f"__window_{width}__{display_stat}"
+            )
+    return names
+
+
+def _spectral_features(
+    hidden_states: torch.Tensor,
+    real_positions: torch.Tensor,
+) -> tuple[torch.Tensor, list[str]]:
+    """Return spectral geometry features for the mean(21-24) block."""
+    stats = _spectral_stats_enabled(SPECTRAL_MODE)
+    names = _spectral_feature_names(SPECTRAL_MODE)
+    if not stats:
+        return torch.zeros(0, device=hidden_states.device), names
+
+    sequence_repr = _layer_window_repr(hidden_states, 21, 24)
+    positions = real_positions.to(device=sequence_repr.device)
+    real_sequence = sequence_repr.index_select(0, positions).to(dtype=torch.float32)
+
+    values: list[torch.Tensor] = []
+    for width in SPECTRAL_WINDOWS:
+        window_values = _spectral_features_for_window(real_sequence, width, stats)
+        values.extend(window_values[stat] for stat in stats)
+
+    if not values:
+        return torch.zeros(0, device=hidden_states.device), names
+    return torch.stack(values).to(dtype=torch.float32), names
+
+
 def _layer_window_repr(
     hidden_states: torch.Tensor,
     start_layer: int,
@@ -194,6 +354,8 @@ def aggregate(
     n_real = float(real_positions.numel())
     seq_len = float(max(int(attention_mask.numel()), 1))
 
+    global _LAST_FEATURE_NAMES
+
     features: list[torch.Tensor] = []
     diagnostics: list[torch.Tensor] = [
         torch.tensor(
@@ -228,7 +390,40 @@ def aggregate(
             ).to(dtype=torch.float32)
         )
 
-    return torch.cat(features + diagnostics, dim=0).to(dtype=torch.float32).cpu()
+    spectral_features, spectral_names = _spectral_features(hs, real_positions)
+    out = torch.cat(features + diagnostics + [spectral_features], dim=0)
+    out = torch.nan_to_num(
+        out.to(dtype=torch.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).cpu()
+    n_hidden = out.numel() - len(spectral_names)
+    _LAST_FEATURE_NAMES = [f"hidden_{i}" for i in range(n_hidden)] + spectral_names
+    return out
+
+
+def get_last_feature_names() -> list[str]:
+    """Return feature names from the most recent ``aggregate`` call."""
+    return list(_LAST_FEATURE_NAMES)
+
+
+def build_feature_names(feature_dim: int) -> list[str]:
+    """Build generic hidden names plus explicit spectral feature names."""
+    spectral_names = _spectral_feature_names(SPECTRAL_MODE)
+    n_hidden = feature_dim - len(spectral_names)
+    if n_hidden < 0:
+        raise ValueError(
+            f"feature_dim={feature_dim} is smaller than the spectral feature "
+            f"count {len(spectral_names)}."
+        )
+    return [f"hidden_{i}" for i in range(n_hidden)] + spectral_names
+
+
+def count_spectral_features(mode: str | None = None) -> int:
+    """Return the number of scalar spectral features for a spectral mode."""
+    mode = SPECTRAL_MODE if mode is None else mode
+    return len(SPECTRAL_WINDOWS) * len(_spectral_stats_enabled(mode))
 
 
 def extract_geometric_features(
