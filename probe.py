@@ -17,14 +17,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 
 PROBE_TYPE = os.getenv("PROBE_TYPE", "logreg")
+PCA_N_COMPONENTS = os.getenv("PCA_N_COMPONENTS", "128")
+THRESHOLD_METRIC = os.getenv("THRESHOLD_METRIC", "accuracy")
 
 
 IMPORTANCE_GROUPS = (
@@ -41,6 +45,106 @@ IMPORTANCE_GROUPS = (
     "spectral_by_window_32",
     "spectral_by_window_64",
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _env_class_weight() -> str | dict | None:
+    value = os.getenv("CLASS_WEIGHT", "none").strip().lower()
+    if value in {"", "none", "null"}:
+        return None
+    return value
+
+
+def _parse_hidden_layers(value: str) -> tuple[int, ...]:
+    cleaned = value.strip().replace("(", "").replace(")", "")
+    if not cleaned:
+        return (64,)
+    return tuple(int(part.strip()) for part in cleaned.split(",") if part.strip())
+
+
+def _safe_pca_components(X: np.ndarray) -> int | None:
+    raw = os.getenv("PCA_N_COMPONENTS", PCA_N_COMPONENTS).strip().lower()
+    if raw in {"none", "no", "false", "0"}:
+        return None
+    requested = int(raw)
+    capped = min(requested, X.shape[0] - 1, X.shape[1])
+    return capped if capped >= 1 else None
+
+
+def _make_classifier(probe_type: str, n_samples: int):
+    class_weight = _env_class_weight()
+    if probe_type == "logreg":
+        return LogisticRegression(
+            penalty="l2",
+            C=_env_float("LOGREG_C", 0.01),
+            class_weight=class_weight,
+            max_iter=5000,
+            solver="lbfgs",
+            random_state=42,
+        )
+    if probe_type == "logreg_l1":
+        return LogisticRegression(
+            penalty="l1",
+            C=_env_float("LOGREG_C", 0.01),
+            class_weight=class_weight,
+            max_iter=5000,
+            solver="liblinear",
+            random_state=42,
+        )
+    if probe_type == "mlp":
+        return MLPClassifier(
+            hidden_layer_sizes=_parse_hidden_layers(os.getenv("MLP_HIDDEN", "64")),
+            activation="relu",
+            alpha=_env_float("MLP_ALPHA", 0.001),
+            batch_size=min(64, max(1, n_samples)),
+            max_iter=2000,
+            early_stopping=True,
+            random_state=42,
+        )
+    if probe_type == "svm_linear":
+        return SVC(
+            kernel="linear",
+            probability=True,
+            C=_env_float("SVM_C", 0.1),
+            class_weight=class_weight,
+            random_state=42,
+        )
+    if probe_type == "svm_rbf":
+        return SVC(
+            kernel="rbf",
+            probability=True,
+            C=_env_float("SVM_C", 1.0),
+            gamma=os.getenv("SVM_GAMMA", "scale"),
+            class_weight=class_weight,
+            random_state=42,
+        )
+    if probe_type == "ridge":
+        return RidgeClassifier(
+            alpha=_env_float("RIDGE_ALPHA", 1.0),
+            class_weight=class_weight,
+            random_state=42,
+        )
+    if probe_type == "knn":
+        return KNeighborsClassifier(
+            n_neighbors=_env_int("KNN_NEIGHBORS", 5),
+            weights=os.getenv("KNN_WEIGHTS", "distance"),
+        )
+    raise ValueError(
+        "PROBE_TYPE must be one of: logreg, mlp, logreg_l1, svm_linear, "
+        "svm_rbf, ridge, knn."
+    )
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -50.0, 50.0)))
 
 
 def _feature_group_indices(feature_names: list[str]) -> dict[str, list[int]]:
@@ -154,6 +258,7 @@ class HallucinationProbe(nn.Module):
         self._scaler = StandardScaler()
         self._classifier: Pipeline | None = None
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._probe_type: str = os.getenv("PROBE_TYPE", PROBE_TYPE)
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
@@ -207,39 +312,13 @@ class HallucinationProbe(nn.Module):
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=int)
 
-        n_components = min(128, X.shape[0] - 1, X.shape[1])
+        self._probe_type = os.getenv("PROBE_TYPE", PROBE_TYPE)
+        n_components = _safe_pca_components(X)
         steps: list[tuple[str, object]] = [("scaler", StandardScaler())]
-        if n_components >= 1:
+        if n_components is not None:
             steps.append(("pca", PCA(n_components=n_components, random_state=42)))
 
-        if PROBE_TYPE == "mlp":
-            steps.append(
-                (
-                    "classifier",
-                    MLPClassifier(
-                        hidden_layer_sizes=(256,),
-                        activation="relu",
-                        alpha=1e-4,
-                        batch_size=min(64, max(1, X.shape[0])),
-                        max_iter=1000,
-                        early_stopping=True,
-                        random_state=42,
-                    ),
-                )
-            )
-        elif PROBE_TYPE == "logreg":
-            steps.append(
-                (
-                    "classifier",
-                    LogisticRegression(
-                        class_weight="balanced",
-                        max_iter=5000,
-                        random_state=42,
-                    ),
-                )
-            )
-        else:
-            raise ValueError("PROBE_TYPE must be either 'logreg' or 'mlp'.")
+        steps.append(("classifier", _make_classifier(self._probe_type, X.shape[0])))
 
         self._classifier = Pipeline(steps)
         self._classifier.fit(X, y)
@@ -248,11 +327,11 @@ class HallucinationProbe(nn.Module):
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
+        """Tune the decision threshold on a validation set.
 
         The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
+        subsequent ``predict`` calls.  ``THRESHOLD_METRIC`` controls whether
+        validation accuracy or F1 is maximized.
 
         Args:
             X_val: Validation feature matrix of shape
@@ -268,13 +347,20 @@ class HallucinationProbe(nn.Module):
         # Candidate thresholds: unique predicted probabilities plus a coarse grid.
         candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
 
+        metric = os.getenv("THRESHOLD_METRIC", THRESHOLD_METRIC).strip().lower()
+        if metric not in {"accuracy", "f1"}:
+            raise ValueError("THRESHOLD_METRIC must be either 'accuracy' or 'f1'.")
+
         best_threshold = 0.5
-        best_f1 = -1.0
+        best_score = -1.0
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
+            if metric == "accuracy":
+                score = accuracy_score(y_val, y_pred_t)
+            else:
+                score = f1_score(y_val, y_pred_t, zero_division=0)
+            if score > best_score:
+                best_score = score
                 best_threshold = float(t)
 
         self._threshold = best_threshold
@@ -308,5 +394,16 @@ class HallucinationProbe(nn.Module):
         if self._classifier is None:
             raise RuntimeError("Probe has not been fitted yet.")
         X = np.asarray(X, dtype=np.float32)
-        prob_pos = self._classifier.predict_proba(X)[:, 1]
+        if hasattr(self._classifier, "predict_proba"):
+            prob_pos = self._classifier.predict_proba(X)[:, 1]
+        elif hasattr(self._classifier, "decision_function"):
+            prob_pos = _sigmoid(self._classifier.decision_function(X))
+        else:
+            y_pred = self._classifier.predict(X)
+            prob_pos = np.asarray(y_pred, dtype=np.float64)
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
+
+    @property
+    def best_threshold(self) -> float:
+        """Decision threshold selected by ``fit_hyperparameters``."""
+        return self._threshold
