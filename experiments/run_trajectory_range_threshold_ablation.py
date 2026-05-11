@@ -1,9 +1,10 @@
 """
 Trajectory range ablation with validation-tuned SVM thresholds.
 
-This experiment keeps the existing split protocol and the current baseline
-representation fixed: mean(21-24) hidden features -> scaler -> PCA, trajectory
-features -> separate scaler, concatenate, then linear SVM.
+This experiment keeps the existing split protocol and the shared response-aware
+baseline fixed: concat(mean(21-24) over response last-token/last8/last16/last32)
+-> scaler -> PCA, trajectory features -> separate scaler, concatenate, then
+linear SVM.
 """
 
 from __future__ import annotations
@@ -34,9 +35,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from experiments.run_trajectory_features import (  # noqa: E402
+    DEFAULT_POOLING_MODES,
+    POOLING_MODE_SHORT,
     _class_distribution,
     _parse_range,
-    build_trajectory_feature_matrix,
+    build_pooled_trajectory_feature_matrix,
     load_or_extract_representations,
 )
 
@@ -474,11 +477,11 @@ def _trajectory_columns_for_groups(names: list[str], groups: tuple[str, ...]) ->
 
 def _apply_debug_subset(
     X_hidden: np.ndarray,
-    layer_vectors: np.ndarray,
+    layer_vectors: dict[str, np.ndarray],
     y: np.ndarray,
     splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]],
     max_samples: int | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]]:
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]]:
     if max_samples is None or max_samples >= len(y):
         return X_hidden, layer_vectors, y, splits
 
@@ -494,12 +497,14 @@ def _apply_debug_subset(
     if not new_splits:
         raise ValueError("--max-samples-debug removed all usable folds.")
     print(f"DEBUG subset active: using first {max_samples} samples and {len(new_splits)} filtered folds.")
-    return X_hidden[:max_samples], layer_vectors[:max_samples], y[:max_samples], new_splits
+    layer_vectors = {mode: values[:max_samples] for mode, values in layer_vectors.items()}
+    return X_hidden[:max_samples], layer_vectors, y[:max_samples], new_splits
 
 
-def _maybe_copy_trajectory_cache(output_dir: Path, token_window: int) -> None:
-    current = output_dir / f"trajectory_cache_tail{token_window}_mean21_24.npz"
-    legacy = ROOT / "results" / "trajectory_features" / f"trajectory_cache_tail{token_window}_mean21_24.npz"
+def _maybe_copy_trajectory_cache(output_dir: Path, token_window: int, pooling_modes: list[str]) -> None:
+    slug = "_".join(POOLING_MODE_SHORT.get(mode, mode).replace("response_", "") for mode in pooling_modes)
+    current = output_dir / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz"
+    legacy = ROOT / "results" / "trajectory_features" / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz"
     if not current.exists() and legacy.exists():
         output_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy, current)
@@ -520,12 +525,16 @@ def main() -> None:
     parser.add_argument("--run-group-ablation", action="store_true")
     parser.add_argument("--max-samples-debug", type=int, default=None)
     parser.add_argument("--token-window", type=int, default=32)
+    parser.add_argument("--pooling-modes", nargs="+", default=list(DEFAULT_POOLING_MODES))
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     output_dir: Path = args.output_dir
     predictions_dir = output_dir / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
+    unsupported = [mode for mode in args.pooling_modes if mode not in POOLING_MODE_SHORT]
+    if unsupported:
+        raise ValueError(f"Unsupported --pooling-modes {unsupported}; expected {list(POOLING_MODE_SHORT)}")
 
     config = {
         "pca_components": args.pca_components,
@@ -538,13 +547,24 @@ def main() -> None:
         "run_group_ablation": args.run_group_ablation,
         "max_samples_debug": args.max_samples_debug,
         "token_window": args.token_window,
+        "pooling_modes": args.pooling_modes,
+        "baseline_definition": (
+            "concat(mean21_24 over response_last_token, response_last_8_mean, "
+            "response_last_16_mean, response_last_32_mean)"
+        ),
+        "hidden_pca_components": args.pca_components,
+        "handcrafted_blocks_use_pca": False,
         "layer_mapping": "cached index 0 = transformer layer 1; hidden_states[1] = transformer layer 1 when embeddings are present",
     }
     with (output_dir / "config.json").open("w") as f:
         json.dump(config, f, indent=2)
 
-    _maybe_copy_trajectory_cache(output_dir, args.token_window)
-    X_hidden, layer_vectors, y, splits = load_or_extract_representations(output_dir, args.token_window)
+    _maybe_copy_trajectory_cache(output_dir, args.token_window, args.pooling_modes)
+    X_hidden, layer_vectors, y, splits = load_or_extract_representations(
+        output_dir,
+        args.token_window,
+        args.pooling_modes,
+    )
     X_hidden, layer_vectors, y, splits = _apply_debug_subset(
         X_hidden,
         layer_vectors,
@@ -553,8 +573,12 @@ def main() -> None:
         args.max_samples_debug,
     )
     print(f"Samples: {len(y)}")
-    print(f"Hidden feature shape before PCA: {X_hidden.shape}")
-    print(f"Layer vector tensor shape: {layer_vectors.shape}")
+    for mode in args.pooling_modes:
+        pooled_hidden = layer_vectors[mode][:, 20:24, :].mean(axis=1)
+        print(f"Baseline pooled hidden block {mode}: {pooled_hidden.shape}")
+    print(f"Final X_hidden shape before PCA: {X_hidden.shape}")
+    for mode in args.pooling_modes:
+        print(f"Layer vector tensor {mode}: {layer_vectors[mode].shape}")
     print(config["layer_mapping"])
 
     range_to_matrix: dict[str, np.ndarray] = {}
@@ -569,7 +593,11 @@ def main() -> None:
         )
     )
     for range_label in unique_ranges:
-        X_traj, names = build_trajectory_feature_matrix(layer_vectors, _parse_range(range_label))
+        X_traj, names = build_pooled_trajectory_feature_matrix(
+            layer_vectors,
+            args.pooling_modes,
+            _parse_range(range_label),
+        )
         X_traj = _safe_matrix(X_traj, f"trajectory range {range_label}")
         range_to_matrix[range_label] = X_traj
         range_to_names[range_label] = names
