@@ -55,9 +55,21 @@ from splitting import split_data  # noqa: E402
 
 MODEL_NAME = _DEFAULT_MODEL
 BATCH_SIZE = 4
+DEFAULT_POOLING_MODES = (
+    "response_last_token",
+    "response_last_8_mean",
+    "response_last_16_mean",
+    "response_last_32_mean",
+)
+POOLING_MODE_SHORT = {
+    "response_last_token": "last_token",
+    "response_last_8_mean": "last8",
+    "response_last_16_mean": "last16",
+    "response_last_32_mean": "last32",
+}
 BLOCKS = (
     "trajectory",
-    "mozeel_lsd",
+    "final_layer",
     "self_alignment",
     "directional_anchor",
     "progress_anchor",
@@ -111,36 +123,49 @@ def _validate_dataset(
     return df, raw, y
 
 
-def _token_span(
+def _pooling_width(pooling_mode: str, token_window: int) -> int:
+    if pooling_mode == "response_last_token":
+        return 1
+    if pooling_mode == "response_last_8_mean":
+        return 8
+    if pooling_mode == "response_last_16_mean":
+        return 16
+    if pooling_mode == "response_last_32_mean":
+        return 32
+    if pooling_mode in {"response_last_k_mean", "full_last_k_mean"}:
+        return token_window
+    raise ValueError(f"Unsupported pooling mode {pooling_mode!r}.")
+
+
+def _response_and_prompt_positions(
     tokenizer,
     prompt: str,
     full_text: str,
     attention_mask: torch.Tensor,
-    token_window: int,
-    pooling: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     real_positions = torch.nonzero(attention_mask.to(dtype=torch.bool), as_tuple=False).flatten()
     if real_positions.numel() == 0:
         real_positions = torch.tensor([attention_mask.numel() - 1], dtype=torch.long)
-    if pooling == "full_last_k_mean":
-        response_positions = real_positions
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+    response_start = min(len(prompt_ids), max(len(full_ids) - 1, 0), int(real_positions[-1].item()))
+    response_end = min(len(full_ids), int(real_positions[-1].item()) + 1)
+    if response_end <= response_start:
+        response_positions = real_positions[-1:]
     else:
-        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
-        start = min(len(prompt_ids), max(len(full_ids) - 1, 0), int(real_positions[-1].item()))
-        end = min(len(full_ids), int(real_positions[-1].item()) + 1)
-        if end <= start:
-            response_positions = real_positions[-1:]
-        else:
-            response_positions = torch.arange(start, end, dtype=torch.long)
-    response_positions = response_positions[-min(token_window, response_positions.numel()) :]
-    prompt_positions = real_positions[real_positions < response_positions[0]]
+        response_positions = torch.arange(response_start, response_end, dtype=torch.long)
+
+    prompt_positions = real_positions[real_positions < response_start]
     if prompt_positions.numel() == 0:
         prompt_positions = real_positions[:1]
-    prompt_positions = prompt_positions[-min(token_window, prompt_positions.numel()) :]
-    if pooling == "response_last_token":
-        response_positions = response_positions[-1:]
+    prompt_positions = prompt_positions[-min(32, prompt_positions.numel()) :]
     return response_positions, prompt_positions
+
+
+def _select_response_positions(response_positions: torch.Tensor, pooling_mode: str, token_window: int) -> torch.Tensor:
+    width = _pooling_width(pooling_mode, token_window)
+    return response_positions[-min(width, response_positions.numel()) :]
 
 
 def _pool_layers(hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -152,16 +177,20 @@ def _pool_layers(hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.
     return torch.stack(vectors, dim=0)
 
 
-def _baseline_from_response_layers(response_layers: np.ndarray) -> np.ndarray:
-    # Match aggregation.py's mean_21_24 hidden pooling shape only for the layer
-    # average vector; diagnostics are omitted because this script's baseline is
-    # explicitly "mean(21-24) response hidden -> PCA".
-    return response_layers[:, 20:24, :].mean(axis=1).astype(np.float32)
+def _baseline_from_response_layers_by_mode(
+    response_layers_by_mode: dict[str, np.ndarray],
+    pooling_modes: list[str],
+) -> np.ndarray:
+    parts = []
+    for mode in pooling_modes:
+        parts.append(response_layers_by_mode[mode][:, 20:24, :].mean(axis=1).astype(np.float32))
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def _cache_file(output_dir: Path, token_window: int, pooling: str, prompt_col: str, answer_col: str) -> Path:
+def _cache_file(output_dir: Path, token_window: int, pooling_modes: list[str], prompt_col: str, answer_col: str) -> Path:
+    pooling_slug = "_".join(POOLING_MODE_SHORT.get(mode, mode).replace("response_", "") for mode in pooling_modes)
     return output_dir / (
-        f"self_lsd_cache_tail{token_window}_{pooling}_{_model_cache_name()}_"
+        f"self_lsd_cache_tail{token_window}_{pooling_slug}_{_model_cache_name()}_"
         f"{prompt_col}_{answer_col}.npz"
     )
 
@@ -169,15 +198,15 @@ def _cache_file(output_dir: Path, token_window: int, pooling: str, prompt_col: s
 def load_or_extract_self_lsd_cache(
     output_dir: Path,
     token_window: int,
-    pooling: str,
+    pooling_modes: list[str],
     prompt_column: str,
     answer_column: str,
     label_column: str,
     truthful_label: int,
     hallucinated_label: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list]:
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, list]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = _cache_file(output_dir, token_window, pooling, prompt_column, answer_column)
+    cache_path = _cache_file(output_dir, token_window, pooling_modes, prompt_column, answer_column)
     if cache_path.exists():
         data = np.load(cache_path, allow_pickle=False)
         splits = []
@@ -186,10 +215,14 @@ def load_or_extract_self_lsd_cache(
             va = np.asarray(data[f"split_{i}_val"], dtype=int)
             te = np.asarray(data[f"split_{i}_test"], dtype=int)
             splits.append((tr, va, te))
+        response_layers_by_mode = {
+            mode: np.asarray(data[f"response_layer_vectors__{mode}"], dtype=np.float32)
+            for mode in pooling_modes
+        }
         print(f"Loaded Self-LSD++ cache: {cache_path}")
         return (
             np.asarray(data["baseline_hidden"], dtype=np.float32),
-            np.asarray(data["response_layer_vectors"], dtype=np.float32),
+            response_layers_by_mode,
             np.asarray(data["prompt_layer_vectors"], dtype=np.float32),
             np.asarray(data["raw_label"], dtype=int),
             np.asarray(data["y"], dtype=int),
@@ -211,7 +244,8 @@ def load_or_extract_self_lsd_cache(
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
-    response_layers, prompt_layers = [], []
+    response_layers = {mode: [] for mode in pooling_modes}
+    prompt_layers = []
     for start in tqdm(range(0, len(texts), BATCH_SIZE), desc="Extracting self-LSD representations", unit="batch"):
         batch = texts[start : start + BATCH_SIZE]
         encoding = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
@@ -221,23 +255,25 @@ def load_or_extract_self_lsd_cache(
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
         for i in range(hidden.size(0)):
-            resp_pos, prompt_pos = _token_span(
+            resp_positions_all, prompt_pos = _response_and_prompt_positions(
                 tokenizer,
                 prompts[start + i],
                 texts[start + i],
                 attention_mask[i].cpu(),
-                token_window,
-                pooling,
             )
-            response_layers.append(_pool_layers(hidden[i], resp_pos).cpu())
+            for mode in pooling_modes:
+                resp_pos = _select_response_positions(resp_positions_all, mode, token_window)
+                response_layers[mode].append(_pool_layers(hidden[i], resp_pos).cpu())
             prompt_layers.append(_pool_layers(hidden[i], prompt_pos).cpu())
 
-    response_arr = np.stack([x.numpy() for x in response_layers]).astype(np.float32)
+    response_arr_by_mode = {
+        mode: np.stack([x.numpy() for x in layers]).astype(np.float32)
+        for mode, layers in response_layers.items()
+    }
     prompt_arr = np.stack([x.numpy() for x in prompt_layers]).astype(np.float32)
-    baseline = _baseline_from_response_layers(response_arr)
+    baseline = _baseline_from_response_layers_by_mode(response_arr_by_mode, pooling_modes)
     payload = {
         "baseline_hidden": baseline,
-        "response_layer_vectors": response_arr,
         "prompt_layer_vectors": prompt_arr,
         "raw_label": raw_label,
         "y": y,
@@ -248,7 +284,7 @@ def load_or_extract_self_lsd_cache(
                     {
                         "model_name": MODEL_NAME,
                         "token_window": token_window,
-                        "pooling": pooling,
+                        "pooling_modes": pooling_modes,
                         "prompt_column": prompt_column,
                         "answer_column": answer_column,
                         "label_column": label_column,
@@ -258,13 +294,15 @@ def load_or_extract_self_lsd_cache(
             ]
         ),
     }
+    for mode, arr in response_arr_by_mode.items():
+        payload[f"response_layer_vectors__{mode}"] = arr
     for i, (tr, va, te) in enumerate(splits):
         payload[f"split_{i}_train"] = tr
         payload[f"split_{i}_val"] = va
         payload[f"split_{i}_test"] = te
     np.savez_compressed(cache_path, **payload)
     print(f"Saved Self-LSD++ cache: {cache_path}")
-    return baseline, response_arr, prompt_arr, raw_label, y, splits
+    return baseline, response_arr_by_mode, prompt_arr, raw_label, y, splits
 
 
 def _safe_cosine_matrix(A: np.ndarray, B: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -370,9 +408,9 @@ def _anchor(response_layers: np.ndarray, layer_range: tuple[int, int], mode: str
     raise ValueError("anchor-mode must be late_mean21_24, final, range_end, or range_mean.")
 
 
-def build_mozeel_lsd_feature_matrix(response_layers: np.ndarray, layer_range: tuple[int, int], anchor_mode: str) -> tuple[np.ndarray, list[str]]:
+def build_final_layer_feature_matrix(response_layers: np.ndarray, layer_range: tuple[int, int], anchor_mode: str) -> tuple[np.ndarray, list[str]]:
     start, end = layer_range
-    prefix = f"mozeel_{start}_{end}"
+    prefix = f"fl_{start}_{end}"
     anchors = _anchor(response_layers, layer_range, anchor_mode)
     rows = []
     for layers, anchor in zip(response_layers, anchors):
@@ -569,6 +607,69 @@ def build_prompt_response_coupling_feature_matrix(prompt_layers: np.ndarray, res
     return np.asarray(rows, dtype=np.float32), names
 
 
+def _replace_prefix(names: list[str], old_prefix: str, new_prefix: str) -> list[str]:
+    return [new_prefix + name[len(old_prefix) :] if name.startswith(old_prefix) else name for name in names]
+
+
+def _pool_prefix(base: str, mode: str, layer_range: tuple[int, int]) -> str:
+    start, end = layer_range
+    return f"{base}_{POOLING_MODE_SHORT[mode]}_{start}_{end}__"
+
+
+def _concat_by_pooling(
+    pooling_modes: list[str],
+    builder,
+    old_prefix_base: str,
+    new_prefix_base: str,
+    layer_range: tuple[int, int],
+    response_layers_by_mode: dict[str, np.ndarray],
+    *extra_args,
+) -> tuple[np.ndarray, list[str]]:
+    matrices, names = [], []
+    start, end = layer_range
+    old_prefix = f"{old_prefix_base}_{start}_{end}__"
+    for mode in pooling_modes:
+        X, mode_names = builder(response_layers_by_mode[mode], layer_range, *extra_args)
+        matrices.append(X)
+        names.extend(_replace_prefix(mode_names, old_prefix, _pool_prefix(new_prefix_base, mode, layer_range)))
+    return np.concatenate(matrices, axis=1).astype(np.float32), names
+
+
+def build_pooled_trajectory_feature_matrix(
+    response_layers_by_mode: dict[str, np.ndarray],
+    pooling_modes: list[str],
+    layer_range: tuple[int, int],
+) -> tuple[np.ndarray, list[str]]:
+    return _concat_by_pooling(
+        pooling_modes,
+        build_trajectory_feature_matrix,
+        "traj",
+        "trajectory",
+        layer_range,
+        response_layers_by_mode,
+    )
+
+
+def build_pooled_prompt_response_coupling_feature_matrix(
+    prompt_layers: np.ndarray,
+    response_layers_by_mode: dict[str, np.ndarray],
+    pooling_modes: list[str],
+    layer_range: tuple[int, int],
+) -> tuple[np.ndarray, list[str]]:
+    matrices, names = [], []
+    start, end = layer_range
+    old_prefix = f"prompt_response_{start}_{end}__"
+    for mode in pooling_modes:
+        X, mode_names = build_prompt_response_coupling_feature_matrix(
+            prompt_layers,
+            response_layers_by_mode[mode],
+            layer_range,
+        )
+        matrices.append(X)
+        names.extend(_replace_prefix(mode_names, old_prefix, _pool_prefix("prompt_response", mode, layer_range)))
+    return np.concatenate(matrices, axis=1).astype(np.float32), names
+
+
 class PostPcaFeatureBlockBuilder:
     def __init__(self, pca_components: int, block_names: list[str]) -> None:
         self.pca_components = pca_components
@@ -641,7 +742,7 @@ def _feature_group(name: str) -> str:
     for group in BLOCKS:
         prefix = {
             "trajectory": "traj_",
-            "mozeel_lsd": "mozeel_",
+            "final_layer": "fl_",
             "self_alignment": "self_align_",
             "directional_anchor": "direction_anchor_",
             "progress_anchor": "progress_anchor_",
@@ -712,6 +813,10 @@ def evaluate_experiment(
         X_train = builder.fit_transform(X_hidden[tr] if use_hidden else None, train_blocks)
         X_val = builder.transform(X_hidden[va] if use_hidden else None, val_blocks)
         X_test = builder.transform(X_hidden[te] if use_hidden else None, test_blocks)
+        print(
+            f"  fold {fold}: hidden_pca_dim={builder.hidden_pca_dim} "
+            f"final_feature_dim={X_train.shape[1]}"
+        )
         names = [f"pca_{i}" for i in range(builder.hidden_pca_dim)]
         for name in enabled:
             names.extend(block_names[name])
@@ -808,7 +913,11 @@ def _debug_subset(X_hidden, response, prompt, raw_label, y, splits, n):
             new_splits.append((trn, van, ten))
     if not new_splits:
         raise ValueError("--max-samples-debug removed all usable folds.")
-    return X_hidden[:n], response[:n], prompt[:n], raw_label[:n], y[:n], new_splits
+    if isinstance(response, dict):
+        response = {mode: arr[:n] for mode, arr in response.items()}
+    else:
+        response = response[:n]
+    return X_hidden[:n], response, prompt[:n], raw_label[:n], y[:n], new_splits
 
 
 def main() -> None:
@@ -819,6 +928,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results" / "self_lsd_plus_ablation")
     parser.add_argument("--layer-ranges", nargs="+", default=["10-24", "12-20", "21-24", "1-24"])
     parser.add_argument("--token-window", type=int, default=32)
+    parser.add_argument("--pooling-modes", nargs="+", default=list(DEFAULT_POOLING_MODES))
     parser.add_argument("--num-thresholds", type=int, default=1000)
     parser.add_argument("--prompt-column", default="prompt")
     parser.add_argument("--answer-column", default="response")
@@ -826,7 +936,7 @@ def main() -> None:
     parser.add_argument("--truthful-label", type=int, default=0)
     parser.add_argument("--hallucinated-label", type=int, default=1)
     parser.add_argument("--anchor-mode", default="late_mean21_24")
-    parser.add_argument("--pooling", default="response_last_k_mean", choices=["response_last_k_mean", "response_last_token", "full_last_k_mean"])
+    parser.add_argument("--pooling", default=None, help="Deprecated compatibility argument; use --pooling-modes.")
     parser.add_argument("--run-permutation-importance", action="store_true")
     parser.add_argument("--importance-experiment", default=None)
     parser.add_argument("--importance-repeats", type=int, default=20)
@@ -834,6 +944,11 @@ def main() -> None:
     args = parser.parse_args()
 
     np.random.seed(args.seed)
+    unsupported = [mode for mode in args.pooling_modes if mode not in POOLING_MODE_SHORT]
+    if unsupported:
+        raise ValueError(f"Unsupported --pooling-modes {unsupported}; expected {list(POOLING_MODE_SHORT)}")
+    if args.pooling is not None:
+        print("WARNING: --pooling is deprecated and ignored; using --pooling-modes.")
     output_dir = args.output_dir
     predictions_dir = output_dir / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -842,6 +957,13 @@ def main() -> None:
         {
             "positive_class": "hallucinated",
             "model_name": MODEL_NAME,
+            "pooling_modes": args.pooling_modes,
+            "baseline_definition": (
+                "concat(mean21_24 over response_last_token, response_last_8_mean, "
+                "response_last_16_mean, response_last_32_mean)"
+            ),
+            "hidden_pca_components": args.pca_components,
+            "handcrafted_blocks_use_pca": False,
             "layer_mapping": "cached index 0 = transformer layer 1; hidden_states[1] = transformer layer 1 when embeddings are present",
             "note": "Reference-free Self-LSD++: own-response late-layer anchor, not truth/reference alignment.",
         }
@@ -849,22 +971,26 @@ def main() -> None:
     with (output_dir / "config.json").open("w") as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, f, indent=2)
 
-    X_hidden, response_layers, prompt_layers, raw_label, y, splits = load_or_extract_self_lsd_cache(
+    X_hidden, response_layers_by_mode, prompt_layers, raw_label, y, splits = load_or_extract_self_lsd_cache(
         output_dir,
         args.token_window,
-        args.pooling,
+        args.pooling_modes,
         args.prompt_column,
         args.answer_column,
         args.label_column,
         args.truthful_label,
         args.hallucinated_label,
     )
-    X_hidden, response_layers, prompt_layers, raw_label, y, splits = _debug_subset(
-        X_hidden, response_layers, prompt_layers, raw_label, y, splits, args.max_samples_debug
+    X_hidden, response_layers_by_mode, prompt_layers, raw_label, y, splits = _debug_subset(
+        X_hidden, response_layers_by_mode, prompt_layers, raw_label, y, splits, args.max_samples_debug
     )
     print(f"Samples: {len(y)}")
-    print(f"Baseline hidden shape: {X_hidden.shape}")
-    print(f"Response layer vectors: {response_layers.shape}")
+    for mode in args.pooling_modes:
+        pooled_hidden = response_layers_by_mode[mode][:, 20:24, :].mean(axis=1)
+        print(f"Baseline pooled hidden block {mode}: {pooled_hidden.shape}")
+    print(f"Final X_hidden shape before PCA: {X_hidden.shape}")
+    for mode in args.pooling_modes:
+        print(f"Response layer vectors {mode}: {response_layers_by_mode[mode].shape}")
     print(f"Prompt layer vectors: {prompt_layers.shape}")
     for i, (tr, va, te) in enumerate(splits, 1):
         print(f"Fold {i}: train={len(tr)} {_class_distribution(y, tr)} val={len(va)} {_class_distribution(y, va)} test={len(te)} {_class_distribution(y, te)}")
@@ -874,13 +1000,25 @@ def main() -> None:
     for range_label in args.layer_ranges:
         layer_range = _parse_range(range_label)
         mats, names = {}, {}
-        mats["trajectory"], names["trajectory"] = build_trajectory_feature_matrix(response_layers, layer_range)
-        mats["mozeel_lsd"], names["mozeel_lsd"] = build_mozeel_lsd_feature_matrix(response_layers, layer_range, args.anchor_mode)
-        mats["self_alignment"], names["self_alignment"] = build_self_alignment_feature_matrix(response_layers, layer_range, args.anchor_mode)
-        mats["directional_anchor"], names["directional_anchor"] = build_directional_anchor_feature_matrix(response_layers, layer_range, args.anchor_mode)
-        mats["progress_anchor"], names["progress_anchor"] = build_anchor_progress_feature_matrix(response_layers, layer_range, args.anchor_mode)
-        mats["orthogonal_drift"], names["orthogonal_drift"] = build_orthogonal_drift_feature_matrix(response_layers, layer_range, args.anchor_mode)
-        mats["prompt_response_coupling"], names["prompt_response_coupling"] = build_prompt_response_coupling_feature_matrix(prompt_layers, response_layers, layer_range)
+        mats["trajectory"], names["trajectory"] = build_pooled_trajectory_feature_matrix(response_layers_by_mode, args.pooling_modes, layer_range)
+        mats["final_layer"], names["final_layer"] = _concat_by_pooling(
+            args.pooling_modes, build_final_layer_feature_matrix, "fl", "fl", layer_range, response_layers_by_mode, args.anchor_mode
+        )
+        mats["self_alignment"], names["self_alignment"] = _concat_by_pooling(
+            args.pooling_modes, build_self_alignment_feature_matrix, "self_align", "self_align", layer_range, response_layers_by_mode, args.anchor_mode
+        )
+        mats["directional_anchor"], names["directional_anchor"] = _concat_by_pooling(
+            args.pooling_modes, build_directional_anchor_feature_matrix, "direction_anchor", "direction_anchor", layer_range, response_layers_by_mode, args.anchor_mode
+        )
+        mats["progress_anchor"], names["progress_anchor"] = _concat_by_pooling(
+            args.pooling_modes, build_anchor_progress_feature_matrix, "progress_anchor", "progress_anchor", layer_range, response_layers_by_mode, args.anchor_mode
+        )
+        mats["orthogonal_drift"], names["orthogonal_drift"] = _concat_by_pooling(
+            args.pooling_modes, build_orthogonal_drift_feature_matrix, "orthogonal_drift", "orthogonal_drift", layer_range, response_layers_by_mode, args.anchor_mode
+        )
+        mats["prompt_response_coupling"], names["prompt_response_coupling"] = build_pooled_prompt_response_coupling_feature_matrix(
+            prompt_layers, response_layers_by_mode, args.pooling_modes, layer_range
+        )
         for key in mats:
             if not np.isfinite(mats[key]).all():
                 print(f"WARNING: non-finite values in {key} {range_label}; replacing with zeros.")
@@ -894,7 +1032,7 @@ def main() -> None:
         specs.extend(
             [
                 (f"E1_current_trajectory_{safe}", range_label, ["trajectory"], True),
-                (f"E2_mozeel_lsd_{safe}", range_label, ["mozeel_lsd"], True),
+                (f"E2_FL_{safe}", range_label, ["final_layer"], True),
                 (f"E3_self_alignment_{safe}", range_label, ["self_alignment"], True),
                 (f"E4_directional_anchor_{safe}", range_label, ["directional_anchor"], True),
                 (f"E5_progress_anchor_{safe}", range_label, ["progress_anchor"], True),
@@ -919,7 +1057,8 @@ def main() -> None:
             predictions_dir, use_hidden=use_hidden,
         )
         summary["anchor_mode"] = args.anchor_mode
-        summary["pooling"] = args.pooling
+        summary["pooling"] = ",".join(args.pooling_modes)
+        summary["pooling_modes"] = ",".join(args.pooling_modes)
         summaries.append(summary)
         feature_names_by_exp[exp] = {
             "all": feature_names,
