@@ -1,9 +1,10 @@
 """
 Compare the current linear SVM trajectory pipeline against small MLP heads.
 
-The feature pipeline is intentionally unchanged:
-  hidden mean(21-24) features -> train-only StandardScaler -> PCA
-  trajectory features -> separate train-only StandardScaler
+The feature pipeline matches the unified trajectory format:
+  response-aware concat(mean(21-24) over last-token/last8/last16/last32)
+    -> train-only StandardScaler -> PCA
+  multi-pooling trajectory features -> separate train-only StandardScaler
   concat -> classifier
 
 This script only swaps the classifier head between:
@@ -32,9 +33,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from experiments.run_trajectory_features import (  # noqa: E402
+    DEFAULT_POOLING_MODES,
+    POOLING_MODE_SHORT,
     _class_distribution,
     _parse_range,
-    build_trajectory_feature_matrix,
+    build_pooled_trajectory_feature_matrix,
     load_or_extract_representations,
 )
 from experiments.run_trajectory_range_threshold_ablation import (  # noqa: E402
@@ -44,12 +47,12 @@ from experiments.run_trajectory_range_threshold_ablation import (  # noqa: E402
 )
 
 
-def _copy_trajectory_cache(output_dir: Path, token_window: int) -> None:
-    target = output_dir / f"trajectory_cache_tail{token_window}_mean21_24.npz"
+def _copy_trajectory_cache(output_dir: Path, token_window: int, pooling_modes: list[str]) -> None:
+    slug = "_".join(POOLING_MODE_SHORT.get(mode, mode).replace("response_", "") for mode in pooling_modes)
+    target = output_dir / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz"
     for source in (
-        ROOT / "results" / "trajectory_range_ablation" / f"trajectory_cache_tail{token_window}_mean21_24.npz",
-        ROOT / "results" / "trajectory_features" / f"trajectory_cache_tail{token_window}_mean21_24.npz",
-        ROOT / "results" / "truth_alignment_ablation" / f"trajectory_cache_tail{token_window}_mean21_24.npz",
+        ROOT / "results" / "trajectory_range_ablation" / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz",
+        ROOT / "results" / "trajectory_features" / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz",
     ):
         if not target.exists() and source.exists():
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -297,6 +300,7 @@ def main() -> None:
     parser.add_argument("--svm-c", type=float, default=0.1)
     parser.add_argument("--trajectory-range", default="10-24")
     parser.add_argument("--token-window", type=int, default=32)
+    parser.add_argument("--pooling-modes", nargs="+", default=list(DEFAULT_POOLING_MODES))
     parser.add_argument("--num-thresholds", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dropout", type=float, default=0.3)
@@ -313,11 +317,29 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    unsupported = [mode for mode in args.pooling_modes if mode not in POOLING_MODE_SHORT]
+    if unsupported:
+        raise ValueError(f"Unsupported --pooling-modes {unsupported}; expected {list(POOLING_MODE_SHORT)}")
+    config = vars(args).copy()
+    config.update(
+        {
+            "baseline_definition": (
+                "concat(mean21_24 over response_last_token, response_last_8_mean, "
+                "response_last_16_mean, response_last_32_mean)"
+            ),
+            "hidden_pca_components": args.pca_components,
+            "handcrafted_blocks_use_pca": False,
+        }
+    )
     with (output_dir / "config.json").open("w") as f:
-        json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
+        json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, f, indent=2)
 
-    _copy_trajectory_cache(output_dir, args.token_window)
-    X_hidden, layer_vectors, y, splits = load_or_extract_representations(output_dir, args.token_window)
+    _copy_trajectory_cache(output_dir, args.token_window, args.pooling_modes)
+    X_hidden, layer_vectors, y, splits = load_or_extract_representations(
+        output_dir,
+        args.token_window,
+        args.pooling_modes,
+    )
     if args.max_samples_debug is not None:
         keep = set(range(args.max_samples_debug))
         remap = {old: new for new, old in enumerate(sorted(keep))}
@@ -331,13 +353,20 @@ def main() -> None:
         if not new_splits:
             raise ValueError("--max-samples-debug removed all usable folds.")
         X_hidden = X_hidden[: args.max_samples_debug]
-        layer_vectors = layer_vectors[: args.max_samples_debug]
+        layer_vectors = {mode: values[: args.max_samples_debug] for mode, values in layer_vectors.items()}
         y = y[: args.max_samples_debug]
         splits = new_splits
 
-    X_traj, traj_names = build_trajectory_feature_matrix(layer_vectors, _parse_range(args.trajectory_range))
+    X_traj, traj_names = build_pooled_trajectory_feature_matrix(
+        layer_vectors,
+        args.pooling_modes,
+        _parse_range(args.trajectory_range),
+    )
     print(f"Samples: {len(y)}")
-    print(f"Hidden feature shape before PCA: {X_hidden.shape}")
+    for mode in args.pooling_modes:
+        pooled_hidden = layer_vectors[mode][:, 20:24, :].mean(axis=1)
+        print(f"Baseline pooled hidden block {mode}: {pooled_hidden.shape}")
+    print(f"Final X_hidden shape before PCA: {X_hidden.shape}")
     print(f"Trajectory range {args.trajectory_range}: {X_traj.shape}")
     for i, (tr, va, te) in enumerate(splits, 1):
         print(
