@@ -2,8 +2,8 @@
 Layer Trajectory Geometry Probe experiment.
 
 This script keeps the repository split protocol intact and evaluates whether
-cross-layer dynamics features add signal beyond the current mean(21-24)
-baseline representation.
+cross-layer dynamics features add signal beyond the shared response-aware
+baseline: concat(mean(21-24) over response last-token/last8/last16/last32).
 
 Layer convention: cached trajectory tensors contain transformer layers 1..24
 only, with array index 0 corresponding to transformer layer 1.  The embedding
@@ -48,6 +48,18 @@ BATCH_SIZE = 4
 BASELINE_AGGREGATION_MODE = "mean_21_24"
 BASELINE_SPECTRAL_MODE = "none"
 N_TRANSFORMER_LAYERS = 24
+DEFAULT_POOLING_MODES = (
+    "response_last_token",
+    "response_last_8_mean",
+    "response_last_16_mean",
+    "response_last_32_mean",
+)
+POOLING_MODE_SHORT = {
+    "response_last_token": "last_token",
+    "response_last_8_mean": "last8",
+    "response_last_16_mean": "last16",
+    "response_last_32_mean": "last32",
+}
 
 
 def _device() -> torch.device:
@@ -80,19 +92,61 @@ def _tail_mean(sequence_repr: torch.Tensor, positions: torch.Tensor, width: int)
     return tail.to(dtype=torch.float32).mean(dim=0)
 
 
-def _layer_vectors_for_sample(
-    hidden_states: torch.Tensor,
+def _response_positions(
+    tokenizer,
+    prompt: str,
+    full_text: str,
     attention_mask: torch.Tensor,
-    token_window: int,
+) -> torch.Tensor:
+    real_positions = _real_token_positions(attention_mask)
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+    start = min(len(prompt_ids), max(len(full_ids) - 1, 0), int(real_positions[-1].item()))
+    end = min(len(full_ids), int(real_positions[-1].item()) + 1)
+    if end <= start:
+        return real_positions[-1:]
+    return torch.arange(start, end, dtype=torch.long)
+
+
+def _pooling_width(pooling_mode: str, token_window: int) -> int:
+    if pooling_mode == "response_last_token":
+        return 1
+    if pooling_mode == "response_last_8_mean":
+        return 8
+    if pooling_mode == "response_last_16_mean":
+        return 16
+    if pooling_mode == "response_last_32_mean":
+        return 32
+    if pooling_mode == "response_last_k_mean":
+        return token_window
+    raise ValueError(f"Unsupported pooling mode {pooling_mode!r}.")
+
+
+def _select_response_positions(response_positions: torch.Tensor, pooling_mode: str, token_window: int) -> torch.Tensor:
+    width = _pooling_width(pooling_mode, token_window)
+    return response_positions[-min(width, response_positions.numel()) :]
+
+
+def _layer_vectors_for_positions(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
 ) -> torch.Tensor:
     """Return pooled vectors for transformer layers 1..24, shape [24, hidden_dim]."""
     hs = aggregation._as_layer_tensor(hidden_states).detach()
-    positions = _real_token_positions(attention_mask).to(device=hs.device)
+    positions = positions.to(device=hs.device)
     vectors: list[torch.Tensor] = []
     for layer_number in range(1, N_TRANSFORMER_LAYERS + 1):
         idx = aggregation.transformer_layer_to_index(layer_number, hs)
-        vectors.append(_tail_mean(hs[idx], positions, token_window))
+        vectors.append(hs[idx].index_select(0, positions).float().mean(dim=0))
     return torch.stack(vectors, dim=0).to(dtype=torch.float32)
+
+
+def _baseline_from_layer_vectors_by_mode(
+    layer_vectors_by_mode: dict[str, np.ndarray],
+    pooling_modes: list[str],
+) -> np.ndarray:
+    parts = [layer_vectors_by_mode[mode][:, 20:24, :].mean(axis=1) for mode in pooling_modes]
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
 def _safe_cosine(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
@@ -262,26 +316,52 @@ def build_trajectory_feature_matrix(
     return np.asarray(rows, dtype=np.float32), names
 
 
-def _cache_file(output_dir: Path, token_window: int) -> Path:
-    return output_dir / f"trajectory_cache_tail{token_window}_mean21_24.npz"
+def _replace_prefix(names: list[str], old_prefix: str, new_prefix: str) -> list[str]:
+    return [new_prefix + name[len(old_prefix) :] if name.startswith(old_prefix) else name for name in names]
+
+
+def build_pooled_trajectory_feature_matrix(
+    layer_vectors_by_mode: dict[str, np.ndarray],
+    pooling_modes: list[str],
+    layer_range: tuple[int, int],
+) -> tuple[np.ndarray, list[str]]:
+    start, end = layer_range
+    old_prefix = f"traj_{start}_{end}__"
+    matrices, names = [], []
+    for mode in pooling_modes:
+        X, mode_names = build_trajectory_feature_matrix(layer_vectors_by_mode[mode], layer_range)
+        matrices.append(X)
+        new_prefix = f"trajectory_{POOLING_MODE_SHORT[mode]}_{start}_{end}__"
+        names.extend(_replace_prefix(mode_names, old_prefix, new_prefix))
+    return np.concatenate(matrices, axis=1).astype(np.float32), names
+
+
+def _cache_file(output_dir: Path, token_window: int, pooling_modes: list[str]) -> Path:
+    slug = "_".join(POOLING_MODE_SHORT.get(mode, mode).replace("response_", "") for mode in pooling_modes)
+    return output_dir / f"trajectory_cache_tail{token_window}_{slug}_response_mean21_24.npz"
 
 
 def load_or_extract_representations(
     output_dir: Path,
     token_window: int,
+    pooling_modes: list[str] | None = None,
 ) -> tuple[
     np.ndarray,
-    np.ndarray,
+    dict[str, np.ndarray],
     np.ndarray,
     list[tuple[np.ndarray, np.ndarray | None, np.ndarray]],
 ]:
     """Load or create baseline hidden features and per-layer pooled vectors."""
+    pooling_modes = list(DEFAULT_POOLING_MODES if pooling_modes is None else pooling_modes)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = _cache_file(output_dir, token_window)
+    cache_path = _cache_file(output_dir, token_window, pooling_modes)
     if cache_path.exists():
         data = np.load(cache_path, allow_pickle=False)
         X_hidden = np.asarray(data["X_hidden"], dtype=np.float32)
-        layer_vectors = np.asarray(data["layer_vectors"], dtype=np.float32)
+        layer_vectors = {
+            mode: np.asarray(data[f"layer_vectors__{mode}"], dtype=np.float32)
+            for mode in pooling_modes
+        }
         y = np.asarray(data["y"], dtype=int)
         splits = []
         for i in range(int(data["n_splits"][0])):
@@ -295,12 +375,12 @@ def load_or_extract_representations(
 
     device = _device()
     print(f"Cache not found. Extracting Qwen hidden states on {device}.")
-    print(f"Token pooling for z_l: mean over last {token_window} real tokens.")
-    aggregation.AGGREGATION_MODE = BASELINE_AGGREGATION_MODE
-    aggregation.SPECTRAL_MODE = BASELINE_SPECTRAL_MODE
+    print(f"Response pooling modes: {', '.join(pooling_modes)}")
 
     df = pd.read_csv(DATA_FILE)
-    texts = [f"{row['prompt']}{row['response']}" for _, row in df.iterrows()]
+    prompts = df["prompt"].astype(str).tolist()
+    responses = df["response"].astype(str).tolist()
+    texts = [f"{prompt}{response}" for prompt, response in zip(prompts, responses)]
     y = np.asarray([int(float(label)) for label in df["label"]], dtype=int)
     splits = split_data(y, df)
 
@@ -309,8 +389,7 @@ def load_or_extract_representations(
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
-    hidden_features: list[torch.Tensor] = []
-    layer_features: list[torch.Tensor] = []
+    layer_features: dict[str, list[torch.Tensor]] = {mode: [] for mode in pooling_modes}
     for start in tqdm(range(0, len(texts), BATCH_SIZE), desc="Extracting representations", unit="batch"):
         batch_texts = texts[start : start + BATCH_SIZE]
         encoding = tokenizer(
@@ -330,24 +409,43 @@ def load_or_extract_representations(
         mask = attention_mask.cpu()
 
         for i in range(hidden.size(0)):
-            baseline = aggregation.aggregation_and_feature_extraction(
-                hidden[i],
+            all_response_positions = _response_positions(
+                tokenizer,
+                prompts[start + i],
+                texts[start + i],
                 mask[i],
-                use_geometric=False,
             )
-            trajectory_layers = _layer_vectors_for_sample(hidden[i], mask[i], token_window)
-            hidden_features.append(baseline.cpu())
-            layer_features.append(trajectory_layers.cpu())
+            for mode in pooling_modes:
+                positions = _select_response_positions(all_response_positions, mode, token_window)
+                layer_features[mode].append(_layer_vectors_for_positions(hidden[i], positions).cpu())
 
-    X_hidden = np.vstack([feature.numpy() for feature in hidden_features]).astype(np.float32)
-    layer_vectors = np.stack([feature.numpy() for feature in layer_features]).astype(np.float32)
+    layer_vectors = {
+        mode: np.stack([feature.numpy() for feature in features]).astype(np.float32)
+        for mode, features in layer_features.items()
+    }
+    X_hidden = _baseline_from_layer_vectors_by_mode(layer_vectors, pooling_modes)
 
     payload: dict[str, object] = {
         "X_hidden": X_hidden,
-        "layer_vectors": layer_vectors,
         "y": y,
         "n_splits": np.asarray([len(splits)], dtype=np.int64),
+        "metadata": np.asarray(
+            [
+                json.dumps(
+                    {
+                        "pooling_modes": pooling_modes,
+                        "baseline_definition": (
+                            "concat(mean21_24 over response_last_token, response_last_8_mean, "
+                            "response_last_16_mean, response_last_32_mean)"
+                        ),
+                        "handcrafted_blocks_use_pca": False,
+                    }
+                )
+            ]
+        ),
     }
+    for mode, values in layer_vectors.items():
+        payload[f"layer_vectors__{mode}"] = values
     for i, (tr, va, te) in enumerate(splits):
         payload[f"split_{i}_train"] = tr
         payload[f"split_{i}_val"] = np.asarray([], dtype=np.int64) if va is None else va
@@ -507,6 +605,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trajectory-ranges", nargs="+", default=["21-24", "10-24", "1-24"])
     parser.add_argument("--token-window", type=int, default=32)
+    parser.add_argument("--pooling-modes", nargs="+", default=list(DEFAULT_POOLING_MODES))
     parser.add_argument("--no-predictions", action="store_true")
     parser.add_argument("--permutation-importance", action="store_true")
     args = parser.parse_args()
@@ -514,12 +613,36 @@ def main() -> None:
     np.random.seed(args.seed)
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    config = vars(args).copy()
+    config.update(
+        {
+            "baseline_definition": (
+                "concat(mean21_24 over response_last_token, response_last_8_mean, "
+                "response_last_16_mean, response_last_32_mean)"
+            ),
+            "hidden_pca_components": args.pca_components,
+            "handcrafted_blocks_use_pca": False,
+        }
+    )
+    with (output_dir / "config.json").open("w") as f:
+        json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, f, indent=2)
 
     t0 = time.time()
-    X_hidden, all_layer_vectors, y, splits = load_or_extract_representations(output_dir, args.token_window)
+    unsupported = [mode for mode in args.pooling_modes if mode not in POOLING_MODE_SHORT]
+    if unsupported:
+        raise ValueError(f"Unsupported --pooling-modes {unsupported}; expected {list(POOLING_MODE_SHORT)}")
+    X_hidden, all_layer_vectors, y, splits = load_or_extract_representations(
+        output_dir,
+        args.token_window,
+        args.pooling_modes,
+    )
     print(f"Samples: {len(y)}")
-    print(f"Hidden feature shape before PCA: {X_hidden.shape}")
-    print(f"Layer vector tensor shape: {all_layer_vectors.shape}")
+    for mode in args.pooling_modes:
+        pooled_hidden = all_layer_vectors[mode][:, 20:24, :].mean(axis=1)
+        print(f"Baseline pooled hidden block {mode}: {pooled_hidden.shape}")
+    print(f"Final X_hidden shape before PCA: {X_hidden.shape}")
+    for mode in args.pooling_modes:
+        print(f"Layer vector tensor {mode}: {all_layer_vectors[mode].shape}")
     for i, (tr, va, te) in enumerate(splits, 1):
         val_dist = {} if va is None else _class_distribution(y, va)
         print(
@@ -532,7 +655,7 @@ def main() -> None:
     trajectory_matrices: dict[str, np.ndarray] = {}
     trajectory_names: dict[str, list[str]] = {}
     for label, layer_range in parsed_ranges.items():
-        X_traj, names = build_trajectory_feature_matrix(all_layer_vectors, layer_range)
+        X_traj, names = build_pooled_trajectory_feature_matrix(all_layer_vectors, args.pooling_modes, layer_range)
         trajectory_matrices[label] = X_traj
         trajectory_names[label] = names
         print(f"Trajectory range {label}: feature shape {X_traj.shape}")
