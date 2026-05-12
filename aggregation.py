@@ -17,22 +17,19 @@ single entry point called from the notebook.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 
-AGGREGATION_MODE = os.getenv("AGGREGATION_MODE", "mean_21_24")
-SPECTRAL_MODE = os.getenv("SPECTRAL_MODE", "none")
+FINAL_TOKEN_WINDOWS = (1, 8, 16, 32, 64, 128, 256, 512)
+FINAL_LAYER_WINDOW = (21, 24)
+FINAL_TRAJECTORY_RANGE = (10, 18)
+TRAJECTORY_FEATURE_DIM = 34
+
+AGGREGATION_MODE = "last_1_8_16_32_64_128_256_512_range"
+SPECTRAL_MODE = "none"
 
 SUPPORTED_AGGREGATION_MODES = (
-    "final_only",
-    "mean_10_20",
-    "mean_13_18",
-    "mean_21_24",
-    "mean_10_20_plus_21_24",
-    "mean_10_20_plus_final",
-    "mean_10_20_plus_21_24_plus_final",
+    AGGREGATION_MODE,
 )
 
 SUPPORTED_SPECTRAL_MODES = (
@@ -135,6 +132,180 @@ def _pool_tail_tokens(
         _tail_mean(real_sequence, 32),
     ]
     return torch.cat(pooled, dim=0), real_sequence
+
+
+def _tail_range_stack(
+    sequence_repr: torch.Tensor,
+    real_positions: torch.Tensor,
+    windows: tuple[int, ...] = FINAL_TOKEN_WINDOWS,
+) -> torch.Tensor:
+    """Concatenate range-pooled tail windows from the final hidden sequence."""
+    positions = real_positions.to(device=sequence_repr.device)
+    real_sequence = sequence_repr.index_select(0, positions).to(dtype=torch.float32)
+    parts: list[torch.Tensor] = []
+    for width in windows:
+        tail = real_sequence[-min(width, real_sequence.size(0)) :]
+        parts.append(tail.max(dim=0).values - tail.min(dim=0).values)
+    return torch.cat(parts, dim=0)
+
+
+def _safe_cosine(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    denom = a.norm(p=2) * b.norm(p=2)
+    if float(denom.detach().cpu()) <= eps:
+        return torch.tensor(0.0, device=a.device, dtype=torch.float32)
+    return (torch.dot(a, b) / (denom + eps)).to(dtype=torch.float32)
+
+
+def _segment_means(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if values.numel() == 0:
+        zero = torch.tensor(0.0, device=values.device, dtype=torch.float32)
+        return zero, zero, zero
+    chunks = torch.tensor_split(values, 3)
+    means = [
+        chunk.mean() if chunk.numel() else torch.tensor(0.0, device=values.device)
+        for chunk in chunks
+    ]
+    return tuple(mean.to(dtype=torch.float32) for mean in means)
+
+
+def _layer_trajectory_vectors(
+    hidden_states: torch.Tensor,
+    real_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Return one pooled vector per transformer layer, shape [24, hidden_dim]."""
+    vectors: list[torch.Tensor] = []
+    positions = real_positions.to(device=hidden_states.device)
+    for layer_number in range(1, 25):
+        idx = transformer_layer_to_index(layer_number, hidden_states)
+        vectors.append(hidden_states[idx].index_select(0, positions).float().mean(dim=0))
+    return torch.stack(vectors, dim=0)
+
+
+def _trajectory_feature_names(layer_start: int, layer_end: int) -> list[str]:
+    suffixes = (
+        "step_mean",
+        "step_std",
+        "step_max",
+        "step_min",
+        "step_median",
+        "step_last",
+        "step_early_mean",
+        "step_mid_mean",
+        "step_late_mean",
+        "early_late_step_ratio",
+        "path_length",
+        "endpoint_distance",
+        "straightness",
+        "cos_step_mean",
+        "cos_step_std",
+        "cos_step_min",
+        "cos_step_max",
+        "cos_first_last",
+        "cos_early_mean",
+        "cos_mid_mean",
+        "cos_late_mean",
+        "late_l2_to_final_mean",
+        "late_l2_to_final_max",
+        "late_cos_to_final_mean",
+        "late_cos_to_final_min",
+        "delta_cos_mean",
+        "delta_cos_std",
+        "delta_cos_min",
+        "delta_cos_max",
+        "curvature_mean",
+        "curvature_max",
+        "early_curvature_mean",
+        "mid_curvature_mean",
+        "late_curvature_mean",
+    )
+    return [f"trajectory_10_18__{suffix}" for suffix in suffixes]
+
+
+def _trajectory_features(
+    hidden_states: torch.Tensor,
+    real_positions: torch.Tensor,
+    layer_start: int = FINAL_TRAJECTORY_RANGE[0],
+    layer_end: int = FINAL_TRAJECTORY_RANGE[1],
+) -> torch.Tensor:
+    """Compute the 34 scalar layer-trajectory features from experiment E_range_10_18."""
+    eps = 1e-8
+    all_layers = _layer_trajectory_vectors(hidden_states, real_positions)
+    Z = all_layers[layer_start - 1 : layer_end].to(dtype=torch.float32)
+    if Z.size(0) < 2:
+        return torch.zeros(TRAJECTORY_FEATURE_DIM, device=hidden_states.device)
+
+    deltas = Z[1:] - Z[:-1]
+    step_norms = deltas.norm(p=2, dim=1)
+    early_step, mid_step, late_step = _segment_means(step_norms)
+    path_length = step_norms.sum()
+    endpoint_distance = (Z[-1] - Z[0]).norm(p=2)
+
+    cos_steps = torch.stack([_safe_cosine(Z[i], Z[i - 1], eps) for i in range(1, Z.size(0))])
+    early_cos, mid_cos, late_cos = _segment_means(cos_steps)
+
+    k = min(4, Z.size(0))
+    late_before_final = Z[-k:-1]
+    if late_before_final.numel():
+        late_l2 = (late_before_final - Z[-1]).norm(p=2, dim=1)
+        late_cos_to_final = torch.stack([_safe_cosine(z, Z[-1], eps) for z in late_before_final])
+        late_l2_mean = late_l2.mean()
+        late_l2_max = late_l2.max()
+        late_cos_mean = late_cos_to_final.mean()
+        late_cos_min = late_cos_to_final.min()
+    else:
+        late_l2_mean = late_l2_max = late_cos_mean = late_cos_min = torch.tensor(
+            0.0, device=hidden_states.device
+        )
+
+    if deltas.size(0) >= 2:
+        delta_cos = torch.stack(
+            [_safe_cosine(deltas[i], deltas[i + 1], eps) for i in range(deltas.size(0) - 1)]
+        )
+        curvature = 1.0 - delta_cos
+        early_curv, mid_curv, late_curv = _segment_means(curvature)
+        delta_values = [
+            delta_cos.mean(),
+            delta_cos.std(unbiased=False),
+            delta_cos.min(),
+            delta_cos.max(),
+            curvature.mean(),
+            curvature.max(),
+            early_curv,
+            mid_curv,
+            late_curv,
+        ]
+    else:
+        delta_values = [torch.tensor(0.0, device=hidden_states.device)] * 9
+
+    values = [
+        step_norms.mean(),
+        step_norms.std(unbiased=False),
+        step_norms.max(),
+        step_norms.min(),
+        step_norms.median(),
+        step_norms[-1],
+        early_step,
+        mid_step,
+        late_step,
+        early_step / (late_step + eps),
+        path_length,
+        endpoint_distance,
+        endpoint_distance / (path_length + eps),
+        cos_steps.mean(),
+        cos_steps.std(unbiased=False),
+        cos_steps.min(),
+        cos_steps.max(),
+        _safe_cosine(Z[0], Z[-1], eps),
+        early_cos,
+        mid_cos,
+        late_cos,
+        late_l2_mean,
+        late_l2_max,
+        late_cos_mean,
+        late_cos_min,
+        *delta_values,
+    ]
+    return torch.nan_to_num(torch.stack(values).to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _spectral_stats_enabled(mode: str) -> tuple[str, ...]:
@@ -351,55 +522,25 @@ def aggregate(
     """
     hs = _as_layer_tensor(hidden_states).detach()
     real_positions = _real_token_positions(attention_mask).to(device=hs.device)
-    n_real = float(real_positions.numel())
-    seq_len = float(max(int(attention_mask.numel()), 1))
 
     global _LAST_FEATURE_NAMES
 
-    features: list[torch.Tensor] = []
-    diagnostics: list[torch.Tensor] = [
-        torch.tensor(
-            [n_real / max(seq_len, 512.0)],
-            device=hs.device,
-            dtype=torch.float32,
-        )
-    ]
-
-    # Windows test where hallucination signal lives in Qwen2.5-0.5B:
-    # 10-20 broad middle-to-late, 13-18 narrower late-middle, 21-24 output-near.
-    for block_type, start_layer, end_layer in _selected_blocks(AGGREGATION_MODE):
-        if block_type == "final":
-            sequence_repr = _final_layer_repr(hs)
-        else:
-            assert start_layer is not None and end_layer is not None
-            sequence_repr = _layer_window_repr(hs, start_layer, end_layer)
-
-        pooled, real_sequence = _pool_tail_tokens(sequence_repr, real_positions)
-        features.append(pooled)
-
-        norm_tail = real_sequence[-min(16, real_sequence.size(0)) :].norm(
-            p=2,
-            dim=1,
-        )
-        diagnostics.append(
-            torch.stack(
-                [
-                    norm_tail.mean(),
-                    norm_tail.std(unbiased=False),
-                ]
-            ).to(dtype=torch.float32)
-        )
-
-    spectral_features, spectral_names = _spectral_features(hs, real_positions)
-    out = torch.cat(features + diagnostics + [spectral_features], dim=0)
+    sequence_repr = _layer_window_repr(hs, *FINAL_LAYER_WINDOW)
+    hidden_features = _tail_range_stack(sequence_repr, real_positions)
+    trajectory_features = _trajectory_features(hs, real_positions)
+    out = torch.cat([hidden_features, trajectory_features], dim=0)
     out = torch.nan_to_num(
         out.to(dtype=torch.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     ).cpu()
-    n_hidden = out.numel() - len(spectral_names)
-    _LAST_FEATURE_NAMES = [f"hidden_{i}" for i in range(n_hidden)] + spectral_names
+    hidden_names = [
+        f"hidden_range_last_{window}_{dim}"
+        for window in FINAL_TOKEN_WINDOWS
+        for dim in range(sequence_repr.size(-1))
+    ]
+    _LAST_FEATURE_NAMES = hidden_names + _trajectory_feature_names(*FINAL_TRAJECTORY_RANGE)
     return out
 
 
@@ -409,15 +550,15 @@ def get_last_feature_names() -> list[str]:
 
 
 def build_feature_names(feature_dim: int) -> list[str]:
-    """Build generic hidden names plus explicit spectral feature names."""
-    spectral_names = _spectral_feature_names(SPECTRAL_MODE)
-    n_hidden = feature_dim - len(spectral_names)
+    """Build final hidden-stack names plus trajectory feature names."""
+    trajectory_names = _trajectory_feature_names(*FINAL_TRAJECTORY_RANGE)
+    n_hidden = feature_dim - len(trajectory_names)
     if n_hidden < 0:
         raise ValueError(
-            f"feature_dim={feature_dim} is smaller than the spectral feature "
-            f"count {len(spectral_names)}."
+            f"feature_dim={feature_dim} is smaller than the trajectory feature "
+            f"count {len(trajectory_names)}."
         )
-    return [f"hidden_{i}" for i in range(n_hidden)] + spectral_names
+    return [f"hidden_{i}" for i in range(n_hidden)] + trajectory_names
 
 
 def count_spectral_features(mode: str | None = None) -> int:
