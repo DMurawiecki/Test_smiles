@@ -10,25 +10,21 @@ and their signatures must not change.
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.neural_network import MLPClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 
-PROBE_TYPE = os.getenv("PROBE_TYPE", "logreg")
-PCA_N_COMPONENTS = os.getenv("PCA_N_COMPONENTS", "128")
-THRESHOLD_METRIC = os.getenv("THRESHOLD_METRIC", "accuracy")
+PROBE_TYPE = "svm_linear"
+PCA_N_COMPONENTS = 80
+SVM_C = 0.1
+TRAJECTORY_FEATURE_DIM = 34
+THRESHOLD_METRIC = "accuracy"
 
 
 IMPORTANCE_GROUPS = (
@@ -47,99 +43,10 @@ IMPORTANCE_GROUPS = (
 )
 
 
-def _env_float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
-
-
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
-
-
-def _env_class_weight() -> str | dict | None:
-    value = os.getenv("CLASS_WEIGHT", "none").strip().lower()
-    if value in {"", "none", "null"}:
-        return None
-    return value
-
-
-def _parse_hidden_layers(value: str) -> tuple[int, ...]:
-    cleaned = value.strip().replace("(", "").replace(")", "")
-    if not cleaned:
-        return (64,)
-    return tuple(int(part.strip()) for part in cleaned.split(",") if part.strip())
-
-
 def _safe_pca_components(X: np.ndarray) -> int | None:
-    raw = os.getenv("PCA_N_COMPONENTS", PCA_N_COMPONENTS).strip().lower()
-    if raw in {"none", "no", "false", "0"}:
-        return None
-    requested = int(raw)
+    requested = int(PCA_N_COMPONENTS)
     capped = min(requested, X.shape[0] - 1, X.shape[1])
     return capped if capped >= 1 else None
-
-
-def _make_classifier(probe_type: str, n_samples: int):
-    class_weight = _env_class_weight()
-    if probe_type == "logreg":
-        return LogisticRegression(
-            penalty="l2",
-            C=_env_float("LOGREG_C", 0.01),
-            class_weight=class_weight,
-            max_iter=5000,
-            solver="lbfgs",
-            random_state=42,
-        )
-    if probe_type == "logreg_l1":
-        return LogisticRegression(
-            penalty="l1",
-            C=_env_float("LOGREG_C", 0.01),
-            class_weight=class_weight,
-            max_iter=5000,
-            solver="liblinear",
-            random_state=42,
-        )
-    if probe_type == "mlp":
-        return MLPClassifier(
-            hidden_layer_sizes=_parse_hidden_layers(os.getenv("MLP_HIDDEN", "64")),
-            activation="relu",
-            alpha=_env_float("MLP_ALPHA", 0.001),
-            batch_size=min(64, max(1, n_samples)),
-            max_iter=2000,
-            early_stopping=True,
-            random_state=42,
-        )
-    if probe_type == "svm_linear":
-        return SVC(
-            kernel="linear",
-            probability=True,
-            C=_env_float("SVM_C", 0.1),
-            class_weight=class_weight,
-            random_state=42,
-        )
-    if probe_type == "svm_rbf":
-        return SVC(
-            kernel="rbf",
-            probability=True,
-            C=_env_float("SVM_C", 1.0),
-            gamma=os.getenv("SVM_GAMMA", "scale"),
-            class_weight=class_weight,
-            random_state=42,
-        )
-    if probe_type == "ridge":
-        return RidgeClassifier(
-            alpha=_env_float("RIDGE_ALPHA", 1.0),
-            class_weight=class_weight,
-            random_state=42,
-        )
-    if probe_type == "knn":
-        return KNeighborsClassifier(
-            n_neighbors=_env_int("KNN_NEIGHBORS", 5),
-            weights=os.getenv("KNN_WEIGHTS", "distance"),
-        )
-    raise ValueError(
-        "PROBE_TYPE must be one of: logreg, mlp, logreg_l1, svm_linear, "
-        "svm_rbf, ridge, knn."
-    )
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -255,10 +162,12 @@ class HallucinationProbe(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._classifier: Pipeline | None = None
+        self._hidden_scaler = StandardScaler()
+        self._trajectory_scaler = StandardScaler()
+        self._pca: PCA | None = None
+        self._classifier: SVC | None = None
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
-        self._probe_type: str = os.getenv("PROBE_TYPE", PROBE_TYPE)
+        self._probe_type: str = PROBE_TYPE
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
@@ -271,11 +180,7 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        pass
 
     # ------------------------------------------------------------------
 
@@ -297,9 +202,10 @@ class HallucinationProbe(nn.Module):
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
 
-        Scales features with ``StandardScaler``, applies PCA with a safe
-        component count, and trains either logistic regression or an optional
-        MLP depending on ``PROBE_TYPE``.
+        The final feature vector is split into the raw hidden stack and the 34
+        trajectory scalars.  The hidden stack gets train-only StandardScaler
+        plus PCA(80); trajectory scalars get a separate StandardScaler.  The
+        concatenated representation is classified by a linear SVM with C=0.1.
 
         Args:
             X: Feature matrix of shape ``(n_samples, feature_dim)``.
@@ -312,17 +218,45 @@ class HallucinationProbe(nn.Module):
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=int)
 
-        self._probe_type = os.getenv("PROBE_TYPE", PROBE_TYPE)
-        n_components = _safe_pca_components(X)
-        steps: list[tuple[str, object]] = [("scaler", StandardScaler())]
-        if n_components is not None:
-            steps.append(("pca", PCA(n_components=n_components, random_state=42)))
+        if X.shape[1] <= TRAJECTORY_FEATURE_DIM:
+            raise ValueError(
+                f"Expected hidden features plus {TRAJECTORY_FEATURE_DIM} trajectory "
+                f"features, got feature_dim={X.shape[1]}."
+            )
 
-        steps.append(("classifier", _make_classifier(self._probe_type, X.shape[0])))
-
-        self._classifier = Pipeline(steps)
-        self._classifier.fit(X, y)
+        X_train = self._fit_transform_features(X)
+        self._classifier = SVC(
+            kernel="linear",
+            probability=False,
+            C=SVM_C,
+            class_weight=None,
+            random_state=42,
+        )
+        self._classifier.fit(X_train, y)
         return self
+
+    def _split_features(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        X = np.asarray(X, dtype=np.float32)
+        return X[:, :-TRAJECTORY_FEATURE_DIM], X[:, -TRAJECTORY_FEATURE_DIM:]
+
+    def _fit_transform_features(self, X: np.ndarray) -> np.ndarray:
+        X_hidden, X_traj = self._split_features(X)
+        hidden_scaled = self._hidden_scaler.fit_transform(X_hidden)
+        n_components = _safe_pca_components(hidden_scaled)
+        if n_components is None:
+            raise ValueError("PCA component count resolved to zero.")
+        self._pca = PCA(n_components=n_components, random_state=42)
+        hidden_pca = self._pca.fit_transform(hidden_scaled)
+        traj_scaled = self._trajectory_scaler.fit_transform(X_traj)
+        return np.concatenate([hidden_pca, traj_scaled], axis=1).astype(np.float32)
+
+    def _transform_features(self, X: np.ndarray) -> np.ndarray:
+        if self._pca is None:
+            raise RuntimeError("Probe preprocessing has not been fitted yet.")
+        X_hidden, X_traj = self._split_features(X)
+        hidden_pca = self._pca.transform(self._hidden_scaler.transform(X_hidden))
+        traj_scaled = self._trajectory_scaler.transform(X_traj)
+        return np.concatenate([hidden_pca, traj_scaled], axis=1).astype(np.float32)
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
@@ -347,7 +281,7 @@ class HallucinationProbe(nn.Module):
         # Candidate thresholds: unique predicted probabilities plus a coarse grid.
         candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
 
-        metric = os.getenv("THRESHOLD_METRIC", THRESHOLD_METRIC).strip().lower()
+        metric = THRESHOLD_METRIC
         if metric not in {"accuracy", "f1"}:
             raise ValueError("THRESHOLD_METRIC must be either 'accuracy' or 'f1'.")
 
@@ -393,7 +327,7 @@ class HallucinationProbe(nn.Module):
         """
         if self._classifier is None:
             raise RuntimeError("Probe has not been fitted yet.")
-        X = np.asarray(X, dtype=np.float32)
+        X = self._transform_features(np.asarray(X, dtype=np.float32))
         if hasattr(self._classifier, "predict_proba"):
             prob_pos = self._classifier.predict_proba(X)[:, 1]
         elif hasattr(self._classifier, "decision_function"):
